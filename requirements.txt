@@ -1,0 +1,9 @@
+# Control Libraries
+asyncio
+
+# Support for Jupyter Notebooks
+nest_asyncio
+
+# Testing
+pytest
+pytest-asyncio

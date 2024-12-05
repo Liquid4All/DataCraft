@@ -2,10 +2,11 @@ import sqlite3
 import os
 import uuid
 import asyncio
+import threading
+import inspect
 from typing import List, Dict, Any, Optional, Union, Callable
-from concurrent.futures import ThreadPoolExecutor
 
-class BaseDataManager:
+class SQLBaseManager:
     """
     Base class containing internal methods for managing database connections,
     table creation, and index processing.
@@ -34,85 +35,6 @@ class BaseDataManager:
         self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_id ON main_table (group_id);')
         self.conn.commit()
 
-    async def _process_index_batch_async(self, index_name: str, batch_uuids: List[str], 
-                                       index_function: Callable) -> List[tuple]:
-        """
-        Process a batch of rows asynchronously for indexing.
-
-        Args:
-            index_name (str): Name of the index
-            batch_uuids (list): List of UUIDs to process
-            index_function (callable): Function to generate index values
-
-        Returns:
-            list: List of (uuid, index_value) tuples
-        """
-        def process_row(row_dict):
-            try:
-                index_values = index_function(row_dict)
-                return row_dict['uuid'], index_values
-            except Exception:
-                return row_dict['uuid'], None
-
-        # Fetch all rows for the batch
-        placeholders = ','.join(['?' for _ in batch_uuids])
-        query = f'SELECT * FROM main_table WHERE uuid IN ({placeholders})'
-        self.cursor.execute(query, batch_uuids)
-        rows = self.cursor.fetchall()
-
-        # Process rows in parallel
-        row_dicts = [{
-            'uuid': row[0],
-            'data_source': row[1],
-            'group_id': row[2],
-            'data_type': row[3],
-            'data': row[4],
-            'files': row[5].split(',')
-        } for row in rows]
-
-        with ThreadPoolExecutor() as executor:
-            loop = asyncio.get_event_loop()
-            tasks = [loop.run_in_executor(executor, process_row, row) 
-                    for row in row_dicts]
-            results = await asyncio.gather(*tasks)
-
-        return results
-
-    def _process_index_batch_sync(self, index_name: str, batch_uuids: List[str], 
-                                index_function: Callable) -> List[tuple]:
-        """
-        Process a batch of rows synchronously for indexing.
-
-        Args:
-            index_name (str): Name of the index
-            batch_uuids (list): List of UUIDs to process
-            index_function (callable): Function to generate index values
-
-        Returns:
-            list: List of (uuid, index_value) tuples
-        """
-        results = []
-        placeholders = ','.join(['?' for _ in batch_uuids])
-        query = f'SELECT * FROM main_table WHERE uuid IN ({placeholders})'
-        self.cursor.execute(query, batch_uuids)
-        
-        for row in self.cursor.fetchall():
-            row_dict = {
-                'uuid': row[0],
-                'data_source': row[1],
-                'group_id': row[2],
-                'data_type': row[3],
-                'data': row[4],
-                'files': row[5].split(',')
-            }
-            try:
-                index_values = index_function(row_dict)
-                results.append((row_dict['uuid'], index_values))
-            except Exception:
-                results.append((row_dict['uuid'], None))
-                
-        return results
-
     def _create_index_tables(self, index_name: str):
         """Create the forward and backward index tables."""
         self.cursor.execute(f'''
@@ -135,7 +57,67 @@ class BaseDataManager:
         self.cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_backward_{index_name} ON index_backward_{index_name} (index_value);')
         self.conn.commit()
 
-class DataManager(BaseDataManager):
+    async def _process_index_batch(self, index_name: str, batch_uuids: List[str], 
+                             index_function: Callable) -> List[tuple]:
+        """
+        Process a batch of rows for indexing, supporting both synchronous and asynchronous functions.
+        Synchronous functions are processed sequentially, while async functions are processed in parallel.
+
+        Args:
+            index_name (str): Name of the index
+            batch_uuids (list): List of UUIDs to process
+            index_function (callable): Function to generate index values, can be sync or async
+
+        Returns:
+            list: List of (uuid, index_value) tuples
+        """
+        # Fetch all rows for the batch
+        placeholders = ','.join(['?' for _ in batch_uuids])
+        query = f'SELECT * FROM main_table WHERE uuid IN ({placeholders})'
+        self.cursor.execute(query, batch_uuids)
+        rows = self.cursor.fetchall()
+
+        # Convert rows to dictionaries
+        row_dicts = [{
+            'uuid': row[0],
+            'data_source': row[1],
+            'group_id': row[2],
+            'data_type': row[3],
+            'data': row[4],
+            'files': row[5].split(',')
+        } for row in rows]
+
+        is_async = inspect.iscoroutinefunction(index_function)
+        results = []
+
+        if is_async:
+            # For async functions, process all rows in parallel
+            async def process_row_async(row_dict):
+                try:
+                    index_values = await index_function(row_dict)
+                    return row_dict['uuid'], index_values
+                except Exception:
+                    return row_dict['uuid'], None
+
+            tasks = [process_row_async(row_dict) for row_dict in row_dicts]
+            results = await asyncio.gather(*tasks)
+        else:
+            # For sync functions, process rows sequentially
+            def process_row_sync(row_dict):
+                try:
+                    index_values = index_function(row_dict)
+                    return row_dict['uuid'], index_values
+                except Exception:
+                    return row_dict['uuid'], None
+
+            # Process each row sequentially
+            results = [process_row_sync(row_dict) for row_dict in row_dicts]
+
+        return results
+    
+####################################################################################################
+
+class DataManager(SQLBaseManager):
     """
     A class for managing data storage and retrieval using SQLite with support for
     batch operations, custom indexing, and async processing.
@@ -154,6 +136,7 @@ class DataManager(BaseDataManager):
             db_path (str): Path to the SQLite database file
         """
         self.db_path = db_path
+        self.lock = threading.Lock()
         self._connect_db()
         self._create_main_table()
 
@@ -173,47 +156,47 @@ class DataManager(BaseDataManager):
         Returns:
             list: List of UUIDs for inserted entries
         """
-        if not isinstance(entries, list):
-            entries = [entries]
+        with self.lock:
+            if not isinstance(entries, list):
+                entries = [entries]
 
-        insert_sql = '''
-        INSERT INTO main_table (uuid, data_source, group_id, data_type, data, files)
-        VALUES (?, ?, ?, ?, ?, ?);
-        '''
-        
-        data_list = []
-        uuids = []
-        
-        for entry in entries:
-            uuid_str = entry.get('uuid_str', str(uuid.uuid4()))
-            uuids.append(uuid_str)
-            files_str = ','.join(entry['files'])
+            insert_sql = '''
+            INSERT INTO main_table (uuid, data_source, group_id, data_type, data, files)
+            VALUES (?, ?, ?, ?, ?, ?);
+            '''
             
-            data_list.append((
-                uuid_str,
-                entry['data_source'],
-                entry['group_id'],
-                entry['data_type'],
-                entry['data'],
-                files_str
-            ))
+            data_list = []
+            uuids = []
+            
+            for entry in entries:
+                uuid_str = entry.get('uuid_str', str(uuid.uuid4()))
+                uuids.append(uuid_str)
+                files_str = ','.join(entry['files'])
+                
+                data_list.append((
+                    uuid_str,
+                    entry['data_source'],
+                    entry['group_id'],
+                    entry['data_type'],
+                    entry['data'],
+                    files_str
+                ))
 
-        self.conn.execute('BEGIN TRANSACTION;')
-        try:
-            self.cursor.executemany(insert_sql, data_list)
-            self.conn.commit()
-        except Exception as e:
-            self.conn.rollback()
-            raise e
+            self.conn.execute('BEGIN TRANSACTION;')
+            try:
+                self.cursor.executemany(insert_sql, data_list)
+                self.conn.commit()
+            except Exception as e:
+                self.conn.rollback()
+                raise e
 
-        return uuids
+            return uuids
 
     def create_index(self, index_name: str, index_function: Callable,
-                    data_sources: Optional[List[str]] = None,
-                    group_ids: Optional[List[str]] = None,
-                    data_types: Optional[List[str]] = None,
-                    batch_size: Optional[int] = None,
-                    async_processing: bool = False):
+                data_sources: Optional[List[str]] = None,
+                group_ids: Optional[List[str]] = None,
+                data_types: Optional[List[str]] = None,
+                batch_size: Optional[int] = None):
         """
         Create a custom index using the provided indexing function.
         
@@ -224,111 +207,103 @@ class DataManager(BaseDataManager):
             group_ids (list, optional): Filter by group IDs
             data_types (list, optional): Filter by data types
             batch_size (int, optional): Number of rows to process in each batch
-            async_processing (bool): Whether to process rows asynchronously
         """
-        # Create index tables if they don't exist
-        self._create_index_tables(index_name)
-        
-        # Build query to get unprocessed rows
-        query_parts = ['SELECT uuid FROM main_table']
-        where_conditions = []
-        params = []
-        
-        # Add NOT EXISTS condition to exclude already processed rows
-        where_conditions.append(f'''
-            NOT EXISTS (
-                SELECT 1 FROM index_forward_{index_name}
-                WHERE row_id = main_table.uuid
-            )
-        ''')
-        
-        if data_sources:
-            placeholders = ','.join(['?' for _ in data_sources])
-            where_conditions.append(f'data_source IN ({placeholders})')
-            params.extend(data_sources)
+        with self.lock:
+            # Create index tables if they don't exist
+            self._create_index_tables(index_name)
             
-        if group_ids:
-            placeholders = ','.join(['?' for _ in group_ids])
-            where_conditions.append(f'group_id IN ({placeholders})')
-            params.extend(group_ids)
+            # Build query to get unprocessed rows
+            query_parts = ['SELECT uuid FROM main_table']
+            where_conditions = []
+            params = []
             
-        if data_types:
-            placeholders = ','.join(['?' for _ in data_types])
-            where_conditions.append(f'data_type IN ({placeholders})')
-            params.extend(data_types)
-            
-        query = query_parts[0]
-        if where_conditions:
-            query += ' WHERE ' + ' AND '.join(where_conditions)
-            
-        # Get all relevant UUIDs
-        self.cursor.execute(query, params)
-        all_uuids = [row[0] for row in self.cursor.fetchall()]
-        
-        if not all_uuids:
-            return
-            
-        # Process in batches
-        batch_size = batch_size or len(all_uuids)
-        
-        for i in range(0, len(all_uuids), batch_size):
-            batch_uuids = all_uuids[i:i + batch_size]
-            
-            # Initialize batch in forward index with empty lists
-            self.conn.execute('BEGIN TRANSACTION;')
-            self.cursor.executemany(
-                f'INSERT INTO index_forward_{index_name} (row_id, index_value) VALUES (?, ?)',
-                [(uuid_str, '') for uuid_str in batch_uuids]
-            )
-            self.conn.commit()
-            
-            # Process batch
-            if async_processing:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                results = loop.run_until_complete(
-                    self._process_index_batch_async(index_name, batch_uuids, index_function)
+            # Add NOT EXISTS condition to exclude already processed rows
+            where_conditions.append(f'''
+                NOT EXISTS (
+                    SELECT 1 FROM index_forward_{index_name}
+                    WHERE row_id = main_table.uuid
                 )
-                loop.close()
-            else:
-                results = self._process_index_batch_sync(index_name, batch_uuids, index_function)
+            ''')
             
-            # Update indexes with results
-            forward_data = []
-            backward_data = []
-            
-            for uuid_str, index_values in results:
-                if index_values is None:  # Failed processing
-                    forward_data.append((uuid_str, None))
-                elif index_values:  # Successful processing with values
-                    for value in index_values:
-                        forward_data.append((uuid_str, value))
-                        backward_data.append((value, uuid_str))
-                        
-            # Update the indexes
-            self.conn.execute('BEGIN TRANSACTION;')
-            try:
-                # Clear temporary entries
-                self.cursor.execute(
-                    f'DELETE FROM index_forward_{index_name} WHERE row_id IN ({",".join("?" * len(batch_uuids))})',
-                    batch_uuids
-                )
+            if data_sources:
+                placeholders = ','.join(['?' for _ in data_sources])
+                where_conditions.append(f'data_source IN ({placeholders})')
+                params.extend(data_sources)
                 
-                # Insert processed results
-                if forward_data:
-                    self.cursor.executemany(
-                        f'INSERT INTO index_forward_{index_name} (row_id, index_value) VALUES (?, ?)',
-                        forward_data
-                    )
-                if backward_data:
-                    self.cursor.executemany(
-                        f'INSERT INTO index_backward_{index_name} (index_value, row_id) VALUES (?, ?)',
-                        backward_data
-                    )
+            if group_ids:
+                placeholders = ','.join(['?' for _ in group_ids])
+                where_conditions.append(f'group_id IN ({placeholders})')
+                params.extend(group_ids)
+                
+            if data_types:
+                placeholders = ','.join(['?' for _ in data_types])
+                where_conditions.append(f'data_type IN ({placeholders})')
+                params.extend(data_types)
+                
+            query = query_parts[0]
+            if where_conditions:
+                query += ' WHERE ' + ' AND '.join(where_conditions)
+                
+            # Get all relevant UUIDs
+            self.cursor.execute(query, params)
+            all_uuids = [row[0] for row in self.cursor.fetchall()]
+            
+            if not all_uuids:
+                return
+                
+            # Process in batches
+            batch_size = batch_size or len(all_uuids)
+            
+            for i in range(0, len(all_uuids), batch_size):
+                batch_uuids = all_uuids[i:i + batch_size]
+                
+                # Initialize batch in forward index with empty lists
+                self.conn.execute('BEGIN TRANSACTION;')
+                self.cursor.executemany(
+                    f'INSERT INTO index_forward_{index_name} (row_id, index_value) VALUES (?, ?)',
+                    [(uuid_str, '') for uuid_str in batch_uuids]
+                )
                 self.conn.commit()
-            except Exception as e:
-                self.conn.rollback()
-                raise e
+                
+                # Process batch
+                results = asyncio.run(self._process_index_batch(index_name, batch_uuids, index_function))
+                
+                # Update indexes with results
+                forward_data = []
+                backward_data = []
+                
+                for uuid_str, index_values in results:
+                    if index_values is None:  # Failed processing
+                        forward_data.append((uuid_str, None))
+                    elif index_values:  # Successful processing with values
+                        for value in index_values:
+                            forward_data.append((uuid_str, value))
+                            backward_data.append((value, uuid_str))
+                            
+                # Update the indexes
+                self.conn.execute('BEGIN TRANSACTION;')
+                try:
+                    # Clear temporary entries
+                    self.cursor.execute(
+                        f'DELETE FROM index_forward_{index_name} WHERE row_id IN ({",".join("?" * len(batch_uuids))})',
+                        batch_uuids
+                    )
+                    
+                    # Insert processed results
+                    if forward_data:
+                        self.cursor.executemany(
+                            f'INSERT INTO index_forward_{index_name} (row_id, index_value) VALUES (?, ?)',
+                            forward_data
+                        )
+                    if backward_data:
+                        self.cursor.executemany(
+                            f'INSERT INTO index_backward_{index_name} (index_value, row_id) VALUES (?, ?)',
+                            backward_data
+                        )
+                    self.conn.commit()
+                except Exception as e:
+                    self.conn.rollback()
+                    raise e
 
     def delete_index(self, index_name):
         """
@@ -340,22 +315,23 @@ class DataManager(BaseDataManager):
         Returns:
             bool: True if tables were deleted, False if no tables were found
         """
-        # Check if tables exist before trying to drop them
-        self.cursor.execute("""
-            SELECT name FROM sqlite_master 
-            WHERE type='table' 
-            AND (name=? OR name=?);
-        """, (f'index_forward_{index_name}', f'index_backward_{index_name}'))
-        
-        existing_tables = self.cursor.fetchall()
-        
-        if not existing_tables:
-            return False
+        with self.lock:
+            # Check if tables exist before trying to drop them
+            self.cursor.execute("""
+                SELECT name FROM sqlite_master 
+                WHERE type='table' 
+                AND (name=? OR name=?);
+            """, (f'index_forward_{index_name}', f'index_backward_{index_name}'))
             
-        self.cursor.execute(f'DROP TABLE IF EXISTS index_forward_{index_name};')
-        self.cursor.execute(f'DROP TABLE IF EXISTS index_backward_{index_name};')
-        self.conn.commit()
-        return True
+            existing_tables = self.cursor.fetchall()
+            
+            if not existing_tables:
+                return False
+                
+            self.cursor.execute(f'DROP TABLE IF EXISTS index_forward_{index_name};')
+            self.cursor.execute(f'DROP TABLE IF EXISTS index_backward_{index_name};')
+            self.conn.commit()
+            return True
 
     def get_data(self, data_sources=None, group_ids=None, limit=0, offset=None):
         """
@@ -425,10 +401,11 @@ class DataManager(BaseDataManager):
         Returns:
             int: Number of records deleted
         """
-        self.cursor.execute("DELETE FROM main_table WHERE group_id = ?", (group_id,))
-        deleted_count = self.cursor.rowcount
-        self.conn.commit()
-        return deleted_count
+        with self.lock:
+            self.cursor.execute("DELETE FROM main_table WHERE group_id = ?", (group_id,))
+            deleted_count = self.cursor.rowcount
+            self.conn.commit()
+            return deleted_count
 
     def get_index_values_for_row(self, index_name, row_id):
         """
