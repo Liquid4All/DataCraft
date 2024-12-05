@@ -1,0 +1,2 @@
+NAME="OBELICS"
+HF_REPO="HuggingFaceM4/OBELICS"
