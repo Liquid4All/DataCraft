@@ -131,8 +131,8 @@ class DownloadManager:
     def wait_for_completion(self, timeout=None) -> None:
         wait(self.futures, timeout=timeout)
 
-    def shutdown(self):
-        self.executor.shutdown(wait=True)
+    def shutdown(self, wait=True) -> None:
+        self.executor.shutdown(wait=wait)
 
 if __name__ == '__main__':
    dm = DownloadManager(num_workers=200)
