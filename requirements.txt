@@ -1,9 +1,14 @@
 # Control Libraries
 asyncio
 
+# Data
+datasets
+huggingface_hub
+
 # Support for Jupyter Notebooks
 nest_asyncio
 
 # Testing
 pytest
 pytest-asyncio
+responses

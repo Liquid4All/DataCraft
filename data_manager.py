@@ -1,10 +1,11 @@
-import sqlite3
-import os
-import uuid
 import asyncio
-import threading
+import datetime
+import json
 import inspect
-from typing import List, Dict, Any, Optional, Union, Callable
+import sqlite3
+import threading
+from typing import List, Dict, Any, Optional, Callable
+import uuid
 
 class SQLBaseManager:
     """
@@ -23,6 +24,12 @@ class SQLBaseManager:
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
 
+        # Apply PRAGMA settings for performance
+        self.cursor.execute('PRAGMA journal_mode = WAL;')
+
+        # Commit the settings
+        self.conn.commit()
+
     def _create_main_table(self):
         """Create the main data table and required indexes if they don't exist."""
         create_table_sql = "CREATE TABLE IF NOT EXISTS main_table ("
@@ -34,6 +41,53 @@ class SQLBaseManager:
         self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_data_source ON main_table (data_source);')
         self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_id ON main_table (group_id);')
         self.conn.commit()
+    
+    def _insert_data(self, entries: Dict[str, List[Any]], batch_size: int = 20000) -> bool:
+        """
+        Insert batch of data entries into database using efficient batching.
+        
+        Args:
+            entries (Dict[str, List[Any]]): Dictionary containing lists of data to insert
+            batch_size (int): Number of records to insert in each batch
+                
+        Returns:
+            bool: True if all insertions were successful
+        """
+        insert_sql = """
+        INSERT INTO main_table (uuid, data_source, group_id, data_type, data, files)
+        VALUES (?, ?, ?, ?, ?, ?);
+        """
+        
+        # Convert entries to list of tuples for batched processing
+        data_list = list(zip(
+            entries["uuid"],
+            entries["data_source"],
+            entries["group_id"],
+            entries["data_type"],
+            entries["data"],
+            entries["files"]
+        ))
+        
+        total_records = len(data_list)
+        records_inserted = 0
+        
+        with self.lock:
+            while records_inserted < total_records:
+                # Get the next batch
+                batch = data_list[records_inserted:records_inserted + batch_size]
+                
+                # Process the batch within a transaction
+                self.conn.execute('BEGIN IMMEDIATE TRANSACTION;')
+                try:
+                    self.cursor.executemany(insert_sql, batch)
+                    self.conn.commit()
+                    self.cursor.execute('PRAGMA wal_checkpoint(TRUNCATE);')
+                    records_inserted += len(batch)
+                except Exception as e:
+                    self.conn.rollback()
+                    raise e
+        
+        return True
 
     def _create_index_tables(self, index_name: str):
         """Create the forward and backward index tables."""
@@ -114,7 +168,7 @@ class SQLBaseManager:
             results = [process_row_sync(row_dict) for row_dict in row_dicts]
 
         return results
-    
+
 ####################################################################################################
 
 class DataManager(SQLBaseManager):
@@ -140,57 +194,29 @@ class DataManager(SQLBaseManager):
         self._connect_db()
         self._create_main_table()
 
-    def insert_data(self, entries: Union[Dict[str, Any], List[Dict[str, Any]]]):
-        """
-        Insert one or more data entries into the database.
+    def insert_data(self, entries: Dict[str, List[Any]], data_source: Optional[str] = None, group_id: Optional[str] = None, data_type: Optional[str] = None):
+        """Insert batch of data entries into database."""
+        num_entries = len(entries['data'])
 
-        Args:
-            entries: Single dictionary or list of dictionaries containing:
-                - data_source (str): Source of the data
-                - group_id (str): Group identifier
-                - data_type (str): Type of data
-                - data (str): Actual data content
-                - files (list): List of associated file paths
-                - uuid_str (str, optional): Custom UUID
-
-        Returns:
-            list: List of UUIDs for inserted entries
-        """
-        with self.lock:
-            if not isinstance(entries, list):
-                entries = [entries]
-
-            insert_sql = '''
-            INSERT INTO main_table (uuid, data_source, group_id, data_type, data, files)
-            VALUES (?, ?, ?, ?, ?, ?);
-            '''
-            
-            data_list = []
-            uuids = []
-            
-            for entry in entries:
-                uuid_str = entry.get('uuid_str', str(uuid.uuid4()))
-                uuids.append(uuid_str)
-                files_str = ','.join(entry['files'])
-                
-                data_list.append((
-                    uuid_str,
-                    entry['data_source'],
-                    entry['group_id'],
-                    entry['data_type'],
-                    entry['data'],
-                    files_str
-                ))
-
-            self.conn.execute('BEGIN TRANSACTION;')
-            try:
-                self.cursor.executemany(insert_sql, data_list)
-                self.conn.commit()
-            except Exception as e:
-                self.conn.rollback()
-                raise e
-
-            return uuids
+        if "data" not in entries:
+            raise ValueError("Data must be provided in entries.")
+        if "uuid" not in entries:
+            entries["uuid"] = [str(uuid.uuid4()) for _ in range(num_entries)]
+        if "data_source" not in entries:
+            if not data_source:
+                raise ValueError("data_source must be provided if not included in entries.")
+            entries["data_source"] = [data_source] * num_entries
+        if "group_id" not in entries:
+            if not group_id:
+                raise ValueError("group_id must be provided if not included in entries.")
+            entries["group_id"] = [group_id] * num_entries
+        if "data_type" not in entries:
+            if not data_type:
+                raise ValueError("data_type must be provided if not included in entries.")
+            entries["data_type"] = [data_type] * num_entries
+        if "files" not in entries:
+            entries["files"] = [json.dumps([])] * num_entries
+        return self._insert_data(entries)
 
     def create_index(self, index_name: str, index_function: Callable,
                 data_sources: Optional[List[str]] = None,
@@ -390,22 +416,117 @@ class DataManager(SQLBaseManager):
             results.append(row_dict)
         
         return results
-
-    def delete_group(self, group_id):
+    
+    def sample_data(self, data_sources=None, group_ids=None, limit=10, offset=None):
         """
-        Delete all data associated with a specific group ID.
+        Fetch a sample of records for each combination of data source and group ID,
+        or for each data source/group ID individually if only one filter is provided.
+        
+        Args:
+            limit (int): Number of records to fetch per combination
+            data_sources (list): Optional list of data sources to sample from
+            group_ids (list): Optional list of group IDs to sample from
+        
+        Returns:
+            list: List of dictionaries containing sample data, with column names as keys
+        """
+        results = []
+        
+        if data_sources and group_ids:
+            # Get samples for each combination of data source and group ID
+            for data_source in data_sources:
+                for group_id in group_ids:
+                    sample = self.get_data(
+                        data_sources=[data_source],
+                        group_ids=[group_id],
+                        limit=limit,
+                        offset=offset
+                    )
+                    results.extend(sample)
+                    
+        elif data_sources:
+            # Get samples for each data source
+            for data_source in data_sources:
+                sample = self.get_data(
+                    data_sources=[data_source],
+                    limit=limit,
+                    offset=offset
+                )
+                results.extend(sample)
+                
+        elif group_ids:
+            # Get samples for each group ID
+            for group_id in group_ids:
+                sample = self.get_data(
+                    group_ids=[group_id],
+                    limit=limit,
+                    offset=offset
+                )
+                results.extend(sample)
+                
+        else:
+            # If no filters provided, get overall sample
+            results = self.get_data(limit=limit)
+        
+        return results
+
+    def delete_group(self, group_id: str, batch_size: int = 1000) -> int:
+        """
+        Delete all data associated with a specific group ID using batched deletions.
         
         Args:
             group_id (str): Group ID to delete
-            
+            batch_size (int): Number of records to delete in each batch
+                
         Returns:
             int: Number of records deleted
         """
+        total_deleted = 0
+        
         with self.lock:
-            self.cursor.execute("DELETE FROM main_table WHERE group_id = ?", (group_id,))
-            deleted_count = self.cursor.rowcount
-            self.conn.commit()
-            return deleted_count
+            # First, get the count of records to be deleted
+            self.cursor.execute(
+                "SELECT COUNT(*) FROM main_table WHERE group_id = ?",
+                (group_id,)
+            )
+            total_records = self.cursor.fetchone()[0]
+            
+            if total_records == 0:
+                return 0
+
+            # Use a more efficient deletion strategy with batching
+            while True:
+                self.conn.execute('BEGIN IMMEDIATE TRANSACTION;')
+                try:
+                    # Delete a batch of records and get their UUIDs first
+                    self.cursor.execute("""
+                        WITH rows_to_delete AS (
+                            SELECT uuid 
+                            FROM main_table 
+                            WHERE group_id = ? 
+                            LIMIT ?
+                        )
+                        DELETE FROM main_table 
+                        WHERE uuid IN (SELECT uuid FROM rows_to_delete)
+                        """, (group_id, batch_size))
+                    
+                    deleted_in_batch = self.cursor.rowcount
+                    if deleted_in_batch == 0:
+                        self.conn.commit()
+                        break
+                        
+                    total_deleted += deleted_in_batch
+                    self.conn.commit()
+                    
+                    # If we've deleted everything, we can stop
+                    if total_deleted >= total_records:
+                        break
+                        
+                except Exception as e:
+                    self.conn.rollback()
+                    raise e
+                
+            return total_deleted
 
     def get_index_values_for_row(self, index_name, row_id):
         """
