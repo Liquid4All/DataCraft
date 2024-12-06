@@ -1,11 +1,16 @@
 import asyncio
-import datetime
+from datetime import datetime
 import json
+import importlib.util
 import inspect
+import os
 import sqlite3
 import threading
 from typing import List, Dict, Any, Optional, Callable
+from tqdm import tqdm
 import uuid
+from utils.download_manager import DownloadManager
+from utils.format import sanitize_filename
 
 class SQLBaseManager:
     """
@@ -42,7 +47,7 @@ class SQLBaseManager:
         self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_id ON main_table (group_id);')
         self.conn.commit()
     
-    def _insert_data(self, entries: Dict[str, List[Any]], batch_size: int = 20000) -> bool:
+    def _insert_data(self, entries: Dict[str, List[Any]], batch_size: int = 20000):
         """
         Insert batch of data entries into database using efficient batching.
         
@@ -171,6 +176,10 @@ class SQLBaseManager:
 
 ####################################################################################################
 
+class _ErrorDownloadManager:
+    def __getattr__(self, _):
+        raise ValueError("DataManager Argument 'download_manager_workers' must be greater than 0 to use download manager features")
+    
 class DataManager(SQLBaseManager):
     """
     A class for managing data storage and retrieval using SQLite with support for
@@ -182,7 +191,7 @@ class DataManager(SQLBaseManager):
         cursor (sqlite3.Cursor): Database cursor object
     """
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, download_manager_workers: int = 0):
         """
         Initialize the DataManager with a database path.
 
@@ -193,6 +202,10 @@ class DataManager(SQLBaseManager):
         self.lock = threading.Lock()
         self._connect_db()
         self._create_main_table()
+        if download_manager_workers > 0:
+            self.download_manager = DownloadManager(num_workers=download_manager_workers)
+        else:
+            self.download_manager = _ErrorDownloadManager()
 
     def insert_data(self, entries: Dict[str, List[Any]], data_source: Optional[str] = None, group_id: Optional[str] = None, data_type: Optional[str] = None):
         """Insert batch of data entries into database."""
@@ -217,7 +230,57 @@ class DataManager(SQLBaseManager):
         if "files" not in entries:
             entries["files"] = [json.dumps([])] * num_entries
         return self._insert_data(entries)
+    
+    def process_dataset(
+        self,
+        processor_file: str,
+        data_folder_path: str,
+        group_id: Optional[str] = None,
+        batch_size: Optional[int] = None
+    ) -> None:
+        """
+        Processes a dataset using a DataInfo class implementation.
+        
+        Args:
+            processor_file: Path to Python file containing Data implementation
+            data_folder_path: Path to the folder where data files will be saved
+            group_id: Group ID for data insertion (defaults to data-name-YYYYMMDD)
+            batch_size: Forces a given batch size for processing
+        """
+        # Import the DataInfo class from the processor file
+        spec = importlib.util.spec_from_file_location("processor", processor_file)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        
+        # Get the DataInfo class
+        DataClass = getattr(module, "Data")
+        data_info = DataClass(data_folder_path)
 
+        # replace batch_size with default_batch_size if not provided
+        if batch_size is None:
+            batch_size = data_info.default_batch_size
+
+        # if group_id is None, then set it to data_source-YYYYMMDD
+        if group_id is None:
+            group_id = f"{sanitize_filename(data_info.data_source)}-{datetime.now().strftime('%Y%m%d')}"
+
+        # Process the dataset with progress bar
+        with tqdm(total=data_info.length, desc="Processing Rows", unit="rows") as pbar:
+            for batch in data_info._iter(batch_size):
+                self.insert_data(
+                    entries=batch,
+                    data_source=data_info.data_source,
+                    group_id=group_id,
+                    data_type=data_info.data_type
+                )
+                
+                # Save any files that were queued
+                for url, path in data_info._iter_files():
+                    self.download_manager.submit(url, path)
+                
+                # Update progress bar
+                pbar.update(batch_size)
+                
     def create_index(self, index_name: str, index_function: Callable,
                 data_sources: Optional[List[str]] = None,
                 group_ids: Optional[List[str]] = None,
