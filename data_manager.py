@@ -1,15 +1,17 @@
 import asyncio
 from datetime import datetime
 import json
+import os
 import importlib.util
 import inspect
-import os
 import sqlite3
+from sqlite3 import IntegrityError
 import threading
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Union
 from tqdm import tqdm
+import hashlib
 import uuid
-from utils.download_manager import DownloadManager
+from utils.file_manager import FileManager
 from utils.format import sanitize_filename
 
 class SQLBaseManager:
@@ -28,9 +30,6 @@ class SQLBaseManager:
         """Establish connection to the SQLite database."""
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
-
-        # Apply PRAGMA settings for performance
-        self.cursor.execute('PRAGMA journal_mode = WAL;')
 
         # Commit the settings
         self.conn.commit()
@@ -86,8 +85,15 @@ class SQLBaseManager:
                 try:
                     self.cursor.executemany(insert_sql, batch)
                     self.conn.commit()
-                    self.cursor.execute('PRAGMA wal_checkpoint(TRUNCATE);')
                     records_inserted += len(batch)
+                except IntegrityError as e:
+                    self.conn.rollback()
+                    if "UNIQUE constraint failed: main_table.uuid" in str(e):
+                        print(f"Error: Duplicate UUID entries detected in the batch.")
+                        print("Suggested solutions:")
+                        print("\t1. Use class function delete() to remove the existing group or data source and try inserting again. The datasets in this batch includ: " + str(set(entries["data_source"])))
+                        print("\t2. Manually review the data to identify which records need to be added")
+                    raise e
                 except Exception as e:
                     self.conn.rollback()
                     raise e
@@ -176,7 +182,7 @@ class SQLBaseManager:
 
 ####################################################################################################
 
-class _ErrorDownloadManager:
+class _ErrorFileManager:
     def __getattr__(self, _):
         raise ValueError("DataManager Argument 'download_manager_workers' must be greater than 0 to use download manager features")
     
@@ -203,18 +209,17 @@ class DataManager(SQLBaseManager):
         self._connect_db()
         self._create_main_table()
         if download_manager_workers > 0:
-            self.download_manager = DownloadManager(num_workers=download_manager_workers)
+            self.file_manager = FileManager(num_workers=download_manager_workers)
         else:
-            self.download_manager = _ErrorDownloadManager()
+            self.file_manager = _ErrorFileManager()
 
-    def insert_data(self, entries: Dict[str, List[Any]], data_source: Optional[str] = None, group_id: Optional[str] = None, data_type: Optional[str] = None):
-        """Insert batch of data entries into database."""
+    def insert_data(self, entries: Dict[str, List[Any]], data_source: Optional[str] = None, 
+                group_id: Optional[str] = None, data_type: Optional[str] = None):
+        """Insert batch of data entries into database with deterministic UUIDs."""
         num_entries = len(entries['data'])
 
         if "data" not in entries:
             raise ValueError("Data must be provided in entries.")
-        if "uuid" not in entries:
-            entries["uuid"] = [str(uuid.uuid4()) for _ in range(num_entries)]
         if "data_source" not in entries:
             if not data_source:
                 raise ValueError("data_source must be provided if not included in entries.")
@@ -229,6 +234,15 @@ class DataManager(SQLBaseManager):
             entries["data_type"] = [data_type] * num_entries
         if "files" not in entries:
             entries["files"] = [json.dumps([])] * num_entries
+
+        if "uuid" not in entries:
+            # Generate deterministic UUIDs based on data, data_source, and files
+            entries["uuid"] = [
+                str(uuid.UUID(bytes=hashlib.sha256(
+                    f"{str(entries['data'][i])}{entries['data_source'][i]}{entries['files'][i]}".encode()
+                ).digest()[:16]))  # Take first 16 bytes for UUID
+                for i in range(num_entries)
+            ]
         return self._insert_data(entries)
     
     def process_dataset(
@@ -236,7 +250,9 @@ class DataManager(SQLBaseManager):
         processor_file: str,
         data_folder_path: str,
         group_id: Optional[str] = None,
-        batch_size: Optional[int] = None
+        batch_size: Optional[int] = None,
+        sample: bool = False,
+        skip_file_download: bool = False
     ) -> None:
         """
         Processes a dataset using a DataInfo class implementation.
@@ -246,7 +262,13 @@ class DataManager(SQLBaseManager):
             data_folder_path: Path to the folder where data files will be saved
             group_id: Group ID for data insertion (defaults to data-name-YYYYMMDD)
             batch_size: Forces a given batch size for processing
+            sample: If True, only processes the first batch of data
+            skip_file_download: If True, skips downloading files
         """
+        # Make sure the file exists
+        if not os.path.exists(processor_file):
+            raise FileNotFoundError(f"Processor file not found: {processor_file}")
+        
         # Import the DataInfo class from the processor file
         spec = importlib.util.spec_from_file_location("processor", processor_file)
         module = importlib.util.module_from_spec(spec)
@@ -275,11 +297,18 @@ class DataManager(SQLBaseManager):
                 )
                 
                 # Save any files that were queued
-                for url, path in data_info._iter_files():
-                    self.download_manager.submit(url, path)
+                if not skip_file_download:
+                    for file_data, path in data_info._iter_files():
+                        self.file_manager.submit(file_data, path)
                 
                 # Update progress bar
-                pbar.update(batch_size)
+                pbar.update(len(batch["uuid"]))
+
+                if sample:
+                    break
+
+        # Wait for all downloads to complete
+        self.file_manager.wait_for_completion()
                 
     def create_index(self, index_name: str, index_function: Callable,
                 data_sources: Optional[List[str]] = None,
@@ -533,63 +562,96 @@ class DataManager(SQLBaseManager):
         
         return results
 
-    def delete_group(self, group_id: str, batch_size: int = 1000) -> int:
+    def delete(self, group_ids: Union[str, List[str]] = None, data_sources: Union[str, List[str]] = None, batch_size: int = 1000) -> int:
         """
-        Delete all data associated with a specific group ID using batched deletions.
+        Delete all data entries associated with specified group IDs and/or data sources, including their index entries.
+        Optimized for constant-time performance relative to database size.
         
         Args:
-            group_id (str): Group ID to delete
-            batch_size (int): Number of records to delete in each batch
+            group_ids (Union[str, List[str]], optional): Single group ID or list of group IDs to delete
+            data_sources (Union[str, List[str]], optional): Single data source or list of data sources to delete
                 
         Returns:
-            int: Number of records deleted
+            int: Number of rows deleted
+                
+        Raises:
+            ValueError: If both group_ids and data_sources are None/empty
         """
-        total_deleted = 0
+        if not group_ids and not data_sources:
+            raise ValueError("At least one of group_ids or data_sources must be provided")
+        
+        # Convert single values to lists for consistent handling
+        if isinstance(group_ids, str):
+            group_ids = [group_ids]
+        if isinstance(data_sources, str):
+            data_sources = [data_sources]
         
         with self.lock:
-            # First, get the count of records to be deleted
-            self.cursor.execute(
-                "SELECT COUNT(*) FROM main_table WHERE group_id = ?",
-                (group_id,)
-            )
-            total_records = self.cursor.fetchone()[0]
-            
-            if total_records == 0:
-                return 0
-
-            # Use a more efficient deletion strategy with batching
-            while True:
-                self.conn.execute('BEGIN IMMEDIATE TRANSACTION;')
-                try:
-                    # Delete a batch of records and get their UUIDs first
-                    self.cursor.execute("""
-                        WITH rows_to_delete AS (
-                            SELECT uuid 
-                            FROM main_table 
-                            WHERE group_id = ? 
-                            LIMIT ?
-                        )
-                        DELETE FROM main_table 
-                        WHERE uuid IN (SELECT uuid FROM rows_to_delete)
-                        """, (group_id, batch_size))
-                    
-                    deleted_in_batch = self.cursor.rowcount
-                    if deleted_in_batch == 0:
-                        self.conn.commit()
-                        break
-                        
-                    total_deleted += deleted_in_batch
-                    self.conn.commit()
-                    
-                    # If we've deleted everything, we can stop
-                    if total_deleted >= total_records:
-                        break
-                        
-                except Exception as e:
-                    self.conn.rollback()
-                    raise e
+            try:
+                self.conn.execute('BEGIN TRANSACTION;')
                 
-            return total_deleted
+                # Cache index table names at initialization
+                if not hasattr(self, '_index_tables'):
+                    self.cursor.execute("""
+                        SELECT name FROM sqlite_master 
+                        WHERE type='table' 
+                        AND (name LIKE 'index_forward_%' OR name LIKE 'index_backward_%')
+                    """)
+                    self._index_tables = [row[0] for row in self.cursor.fetchall()]
+                
+                # Build the WHERE clause dynamically based on provided parameters
+                where_clauses = []
+                params = []
+                
+                if group_ids:
+                    placeholders = ','.join(['?' for _ in group_ids])
+                    where_clauses.append(f'group_id IN ({placeholders})')
+                    params.extend(group_ids)
+                    
+                if data_sources:
+                    placeholders = ','.join(['?' for _ in data_sources])
+                    where_clauses.append(f'data_source IN ({placeholders})')
+                    params.extend(data_sources)
+                    
+                where_clause = ' OR '.join(where_clauses)
+                
+                # Process in batches to handle large deletions
+                total_deleted = 0
+                
+                while True:
+                    # Get next batch of UUIDs to delete using the indexed columns
+                    self.cursor.execute(
+                        f'SELECT uuid FROM main_table WHERE {where_clause} LIMIT {batch_size}',
+                        params
+                    )
+                    batch_uuids = [row[0] for row in self.cursor.fetchall()]
+                    
+                    if not batch_uuids:
+                        break
+                    
+                    # Delete from index tables using batched UUIDs
+                    uuid_placeholders = ','.join(['?' for _ in batch_uuids])
+                    for table in self._index_tables:
+                        col_name = 'row_id'
+                        self.cursor.execute(
+                            f'DELETE FROM {table} WHERE {col_name} IN ({uuid_placeholders})',
+                            batch_uuids
+                        )
+                    
+                    # Delete from main table
+                    self.cursor.execute(
+                        f'DELETE FROM main_table WHERE uuid IN ({uuid_placeholders})',
+                        batch_uuids
+                    )
+                    
+                    total_deleted += len(batch_uuids)
+                
+                self.conn.commit()
+                return total_deleted
+                
+            except Exception as e:
+                self.conn.rollback()
+                raise e
 
     def get_index_values_for_row(self, index_name, row_id):
         """

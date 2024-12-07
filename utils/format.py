@@ -5,7 +5,7 @@ def name_url(url):
     """
     Generate a unique name for a URL.
     """
-    return hashlib.md5(url.encode()).hexdigest()[:8] + url.split("/")[-1].split("?")[0][-100:]
+    return hashlib.md5(url.encode()).hexdigest()[:8] + "-" + url.split("/")[-1].split("?")[0][-100:]
 
 def sanitize_filename(text):
     """

@@ -1,7 +1,27 @@
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Iterator, Generator, Tuple
+from dataclasses import dataclass
+from typing import List, Dict, Iterator, Generator, Tuple, Any
 from collections import deque
 
+class HFStaticDataIterator:
+    """
+    Iterator that uses select() for efficient batch processing of huggingface Datasets.
+    
+    Most of the time the batch iterator of the dataset is sufficient, but in some cases
+    it can lead to excessive slow down. This iterator is designed to be more efficient.
+    """
+    def __init__(self, dataset):
+        self.dataset = dataset
+    
+    def iter(self, batch_size):
+        current_index = 0
+        dataset_size = len(self.dataset)
+        
+        while current_index < dataset_size:
+            end_idx = min(current_index + batch_size, dataset_size)
+            batch = self.dataset.select(range(current_index, end_idx))
+            yield batch.data
+            current_index = end_idx
+    
 @dataclass
 class BaseData:
     """
@@ -78,7 +98,8 @@ class BaseData:
             self._load()
 
         base_iterator = self._dataset.iter(batch_size=batch_size)
-        return (self.batch_process(batch) for batch in base_iterator)
+        future_iterator = (self.batch_process(batch) for batch in base_iterator)
+        return future_iterator
     
     def _iter_files(self) -> Generator[Tuple[str, str], None, None]:
         """

@@ -4,6 +4,14 @@ asyncio
 # Data
 datasets
 huggingface_hub
+pillow
+opencv-python
+soundfile
+decord
+numpy
+torch
+torchvision
+torchaudio
 
 # Support for Jupyter Notebooks
 nest_asyncio
