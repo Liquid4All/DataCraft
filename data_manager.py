@@ -249,6 +249,7 @@ class DataManager(SQLBaseManager):
         self,
         processor_file: str,
         data_folder_path: str,
+        dataset_subset: Optional[str] = None,
         group_id: Optional[str] = None,
         batch_size: Optional[int] = None,
         sample: bool = False,
@@ -260,6 +261,7 @@ class DataManager(SQLBaseManager):
         Args:
             processor_file: Path to Python file containing Data implementation
             data_folder_path: Path to the folder where data files will be saved
+            dataset_subset: Name of the dataset subset to process
             group_id: Group ID for data insertion (defaults to data-name-YYYYMMDD)
             batch_size: Forces a given batch size for processing
             sample: If True, only processes the first batch of data
@@ -274,9 +276,11 @@ class DataManager(SQLBaseManager):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         
-        # Get the DataInfo class
+        # Get the DataInfo class and set data_folder_path and dataset_subset BEFORE Initialization so they can be used in any custom init function
         DataClass = getattr(module, "Data")
-        data_info = DataClass(data_folder_path)
+        DataClass.data_folder_path = data_folder_path
+        DataClass.dataset_subset = dataset_subset
+        data_info = DataClass()
 
         # replace batch_size with default_batch_size if not provided
         if batch_size is None:

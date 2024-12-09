@@ -1,4 +1,4 @@
-from utils.dataframe import BaseData
+from utils.dataframe import BaseData, HFStaticDataIterator
 import os
 import json
 from utils.format import name_url
@@ -10,7 +10,7 @@ class Data(BaseData):
         self.image_folder_path = os.path.join(self.data_folder_path, "pixmo-cap-images")
         if not os.path.exists(self.image_folder_path):
             os.makedirs(self.image_folder_path)
-        return load_dataset('allenai/pixmo-cap', split='train')
+        return HFStaticDataIterator(load_dataset('allenai/pixmo-cap', split='train'))
 
     def batch_process(self, examples):
         urls = examples["image_url"]

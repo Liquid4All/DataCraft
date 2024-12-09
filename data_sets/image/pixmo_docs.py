@@ -4,13 +4,16 @@ import json
 from datasets import load_dataset
 
 class Data(BaseData):
-    data_source = "pixmo_docs_charts"
-    pixmo_docs_group = "charts"
+    def __init__(self):
+        assert self.dataset_subset is not None, """Must provide dataset_subset, choose from ["charts", "diagrams", "other", "tables"]"""
+        assert self.dataset_subset in ["charts", "diagrams", "other", "tables"], f"""dataset_subset must be one of ["charts", "diagrams", "other", "tables"], got {self.dataset_subset}"""
+        self.data_source = "pixmo_docs_" + self.dataset_subset
+
     def load(self):
         self.image_folder_path = os.path.join(self.data_folder_path, "pixmo-docs-images")
         if not os.path.exists(self.image_folder_path):
             os.makedirs(self.image_folder_path)
-        return HFStaticDataIterator(load_dataset('allenai/pixmo-docs', self.pixmo_docs_group, split='train'))
+        return HFStaticDataIterator(load_dataset('allenai/pixmo-docs', self.dataset_subset, split='train'))
 
     def batch_process(self, examples):
         images = examples["image"]

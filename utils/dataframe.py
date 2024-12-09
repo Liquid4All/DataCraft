@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict, Iterator, Generator, Tuple, Any
 from collections import deque
 
@@ -29,18 +29,21 @@ class BaseData:
     Handles both the loading and batch processing of data, with built-in iteration
     and file management capabilities.
     """
+    # Required fields (often set by superclass)
     data_source: str
     data_type: str = "default"
     length: int = None
     default_batch_size: int = 10000
 
-    def __init__(self, data_folder_path):
-        # Initialize internal state
-        self.data_folder_path = data_folder_path
-        self._dataset = None
-        self._current_index = 0
-        self._files_to_save = deque()
-        self._is_loaded = False
+    # Directly managed by data_manager
+    data_folder_path: str = field(default=None)
+    dataset_subset: Any = field(default=None)
+
+    # Objects managed by the class
+    _dataset = None
+    _current_index = 0
+    _files_to_save = deque()
+    _is_loaded = False
     
     def load(self) -> None:
         """
@@ -108,3 +111,6 @@ class BaseData:
         """
         while self._files_to_save:
             yield self._files_to_save.popleft()
+    
+    def __setattr__(self, name, value):
+        self.__dict__[name] = value
