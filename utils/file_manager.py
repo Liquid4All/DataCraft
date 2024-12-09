@@ -119,7 +119,18 @@ def save_file(
     path.parent.mkdir(parents=True, exist_ok=True)
     
     content_type = detect_content_type(data)
-    operation_type = 'write'  # default operation type
+    operation_type = 'write'
+
+    # if file already exists, return success
+    if path.exists():
+        return {
+            'status': 200,
+            'file': str(path),
+            'size': path.stat().st_size,
+            'content_type': content_type,
+            'success': True,
+            'operation_type': "check"
+        }
     
     try:
         if content_type == 'url':
