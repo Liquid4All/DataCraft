@@ -1,16 +1,30 @@
 from dataclasses import dataclass, field
 from typing import List, Dict, Iterator, Generator, Tuple, Any
 from collections import deque
+import pyarrow as pa
 
 class HFStaticDataIterator:
     """
     Iterator that uses select() for efficient batch processing of huggingface Datasets.
+    Returns batches in standard Python types rather than PyArrow format.
     
-    Most of the time the batch iterator of the dataset is sufficient, but in some cases
-    it can lead to excessive slow down. This iterator is designed to be more efficient.
+    Args:
+        dataset: A HuggingFace dataset object
+        
+    Returns:
+        Batches of data in standard Python types (lists, dicts, etc.)
     """
     def __init__(self, dataset):
         self.dataset = dataset
+    
+    def _convert_to_python_type(self, value):
+        """Helper method to convert various types to Python native types."""
+        if isinstance(value, (pa.Array, pa.ChunkedArray)):
+            return value.to_pandas().tolist()
+        elif isinstance(value, list):
+            return value
+        else:
+            return [value]  # Single value case
     
     def iter(self, batch_size):
         current_index = 0
@@ -19,7 +33,14 @@ class HFStaticDataIterator:
         while current_index < dataset_size:
             end_idx = min(current_index + batch_size, dataset_size)
             batch = self.dataset.select(range(current_index, end_idx))
-            yield batch.data
+            
+            # Convert each feature to Python types
+            batch_dict = {
+                key: self._convert_to_python_type(batch[key])
+                for key in batch.features.keys()
+            }
+            
+            yield batch_dict
             current_index = end_idx
     
 @dataclass
@@ -44,6 +65,9 @@ class BaseData:
     _current_index = 0
     _files_to_save = deque()
     _is_loaded = False
+
+    def __init__(self):
+        pass
     
     def load(self) -> None:
         """

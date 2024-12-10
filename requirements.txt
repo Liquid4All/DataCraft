@@ -12,6 +12,7 @@ numpy
 torch
 torchvision
 torchaudio
+vllm
 
 # Support for Jupyter Notebooks
 nest_asyncio

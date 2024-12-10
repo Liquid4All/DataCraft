@@ -40,3 +40,39 @@ def sanitize_filename(text):
         sanitized = 'unnamed_file'
         
     return sanitized
+
+def image_conversation(question, answer, images):
+    """
+    Args:
+        question (str): Question text
+        answer (str): Answer text
+        images (List[str]): List of image URLs
+
+    Returns:
+    [
+        {
+            "role": str,
+            "content": [
+                {
+                    "type": "text",
+                    "value": str
+                }
+            ]
+        }
+    ]
+    """
+    image_content = [{"type": "image", "value": image} for image in images]
+    return [
+        {
+            "role": "user", 
+            "content": [
+                {"type": "text", "value": question},
+            ] + image_content
+        },
+        {
+            "role": "assistant", 
+            "content": [
+                {"type": "text", "value": answer},
+            ] + image_content
+        }
+    ]

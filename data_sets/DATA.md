@@ -11,7 +11,6 @@
 ```json
 {
   "conversations": [
-    [
       {
         "role": "system",
         "content": [
@@ -44,11 +43,11 @@
         ]
       },
       // Additional Messages
-    ],
-    // Additional Conversations
-  ]
+    ]
 }
 ```
+- Roles should be in "system", "user", or "assistant"
+- If there are multiple (seperate) conversations per image, they should be stored as seperate lines. E.g. return a list longer than the batch size. 
 
 # 3. Bounding Box (Image Specific)
 
@@ -62,15 +61,31 @@
   ]
 }
 ```
+Ensure that the coordinates represent (0,0) as the top-left corner of the image, and ideally are normalized 0-1.
 
-Where:
+# 4. Points
+```json
 
-- **label**: A string representing the class, category or description of the object.
-- **coordinates**: An array of four numbers [x1, y1, x2, y2], representing the normalized top-left (x1, y1) and bottom-right (x2, y2) coordinates of the bounding box.
+{
 
-Ensure that the coordinates are normalized between 0 and 1, with (0,0) representing the top-left corner of the image.
+  "points": [
 
-# 4. Tabular Data
+    {
+
+      "label": "point_label",
+
+      "coordinates": [x, y]
+
+    }
+
+  ]
+
+}
+
+```
+Ensure that the coordinates represent (0,0) as the top-left corner of the image, and ideally are normalized 0-1.
+
+# 5. Tabular Data
 
 ```json
 {
