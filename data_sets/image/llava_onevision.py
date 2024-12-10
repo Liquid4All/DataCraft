@@ -1,4 +1,4 @@
-from utils.dataframe import BaseData, HFStaticDataIterator
+from utils.dataframe import BaseData
 import os
 import json
 from datasets import load_dataset

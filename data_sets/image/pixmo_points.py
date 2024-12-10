@@ -75,5 +75,5 @@ class Data(BaseData):
 
         return {
             "data": information,
-            "files": images
+            "files": [json.dumps([img_path]) for img_path in images]
         }

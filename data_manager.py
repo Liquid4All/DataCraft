@@ -5,9 +5,8 @@ import os
 import importlib.util
 import inspect
 import sqlite3
-from sqlite3 import IntegrityError
 import threading
-from typing import List, Dict, Any, Optional, Callable, Union
+from typing import List, Dict, Any, Optional, Callable, Union, Tuple
 from tqdm import tqdm
 import hashlib
 import uuid
@@ -46,19 +45,19 @@ class SQLBaseManager:
         self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_id ON main_table (group_id);')
         self.conn.commit()
     
-    def _insert_data(self, entries: Dict[str, List[Any]], batch_size: int = 20000):
+    def _insert_data(self, entries: Dict[str, List[Any]], batch_size: int = 20000) -> Tuple[bool, List[str]]:
         """
-        Insert batch of data entries into database using efficient batching.
+        Insert batch of data entries into database, skipping existing records.
         
         Args:
             entries (Dict[str, List[Any]]): Dictionary containing lists of data to insert
             batch_size (int): Number of records to insert in each batch
                 
         Returns:
-            bool: True if all insertions were successful
+            Tuple[bool, List[str]]: (Success status, List of skipped UUIDs)
         """
         insert_sql = """
-        INSERT INTO main_table (uuid, data_source, group_id, data_type, data, files)
+        INSERT OR IGNORE INTO main_table (uuid, data_source, group_id, data_type, data, files)
         VALUES (?, ?, ?, ?, ?, ?);
         """
         
@@ -74,11 +73,23 @@ class SQLBaseManager:
         
         total_records = len(data_list)
         records_inserted = 0
+        skipped_uuids = []
+        
+        # First, get existing UUIDs
+        existing_uuids = set()
+        self.cursor.execute("SELECT uuid FROM main_table WHERE uuid IN ({})".format(
+            ','.join('?' * len(entries["uuid"]))
+        ), entries["uuid"])
+        existing_uuids.update(row[0] for row in self.cursor.fetchall())
         
         with self.lock:
             while records_inserted < total_records:
                 # Get the next batch
                 batch = data_list[records_inserted:records_inserted + batch_size]
+                
+                # Track which UUIDs in this batch already exist
+                batch_uuids = [item[0] for item in batch]
+                skipped_uuids.extend([uuid for uuid in batch_uuids if uuid in existing_uuids])
                 
                 # Process the batch within a transaction
                 self.conn.execute('BEGIN IMMEDIATE TRANSACTION;')
@@ -86,19 +97,14 @@ class SQLBaseManager:
                     self.cursor.executemany(insert_sql, batch)
                     self.conn.commit()
                     records_inserted += len(batch)
-                except IntegrityError as e:
-                    self.conn.rollback()
-                    if "UNIQUE constraint failed: main_table.uuid" in str(e):
-                        print(f"Error: Duplicate UUID entries detected in the batch.")
-                        print("Suggested solutions:")
-                        print("\t1. Use class function delete() to remove the existing group or data source and try inserting again. The datasets in this batch includ: " + str(set(entries["data_source"])))
-                        print("\t2. Manually review the data to identify which records need to be added")
-                    raise e
                 except Exception as e:
                     self.conn.rollback()
                     raise e
         
-        return True
+        if skipped_uuids:
+            print(f"Skipped {len(skipped_uuids)} existing records.")
+            
+        return True, skipped_uuids
 
     def _create_index_tables(self, index_name: str):
         """Create the forward and backward index tables."""

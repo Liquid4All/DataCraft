@@ -73,6 +73,6 @@ def image_conversation(question, answer, images):
             "role": "assistant", 
             "content": [
                 {"type": "text", "value": answer},
-            ] + image_content
+            ]
         }
     ]

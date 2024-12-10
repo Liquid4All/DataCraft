@@ -51,6 +51,6 @@ class Data(BaseData):
 
         data = {
             "data": conversations,
-            "files": images
+            "files": [json.dumps([img_path]) for img_path in images]
         }
         return data
