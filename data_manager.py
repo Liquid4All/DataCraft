@@ -45,7 +45,7 @@ class SQLBaseManager:
         self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_id ON main_table (group_id);')
         self.conn.commit()
     
-    def _insert_data(self, entries: Dict[str, List[Any]], batch_size: int = 20000) -> Tuple[bool, List[str]]:
+    def _insert_data(self, entries: Dict[str, List[Any]], batch_size: int = 100000) -> Tuple[bool, List[str]]:
         """
         Insert batch of data entries into database, skipping existing records.
         

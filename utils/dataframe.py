@@ -54,7 +54,7 @@ class BaseData:
     data_source: str
     data_type: str = "default"
     length: int = None
-    default_batch_size: int = 10000
+    default_batch_size: int = 100000
 
     # Directly managed by data_manager
     data_folder_path: str = field(default=None)
