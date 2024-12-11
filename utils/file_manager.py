@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, wait
-from collections import deque
+from collections import deque, OrderedDict
 from dataclasses import dataclass
 from threading import Lock
 from typing import Optional, List, Deque, Dict, Union, Any
@@ -201,6 +201,10 @@ class FileManager:
         self.lock = Lock()
         self.start_time = time.time()
         
+        # Cache for recent requests
+        self.request_cache = OrderedDict()
+        self.max_cache_size = num_workers  # Cache size matches worker count
+        
         # Running statistics
         self.completed = 0
         self.failed = 0
@@ -208,6 +212,37 @@ class FileManager:
         self.ema_size = 0
         self.ema_alpha = ema_alpha
     
+    def submit(self, data: Union[str, bytes, object], path: str, id: Optional[str] = None) -> None:
+        with self.lock:
+            # Check if this request is already in progress
+            if path in self.request_cache:
+                self.cache_hits += 1
+                # Move the existing future to the end (most recent)
+                self.request_cache.move_to_end(path)
+                return
+            
+            self.cache_misses += 1
+            
+            # Add placeholder to cache before submitting
+            self.request_cache[path] = None
+            
+            # If cache is too large, remove oldest entry
+            if len(self.request_cache) > self.max_cache_size:
+                self.request_cache.popitem(last=False)
+            
+            try:
+                # Submit the task
+                future = self.executor.submit(save_file, data, path)
+                future.add_done_callback(self._task_complete)
+                
+                # Update cache and futures with the actual future
+                self.request_cache[path] = future
+                self.futures[future] = {'data': data, 'path': path, 'id': id}
+            except Exception as e:
+                # If submission fails, remove from cache
+                self.request_cache.pop(path, None)
+                raise e
+
     def submit(self, data: Union[str, bytes, object], path: str, id: Optional[str] = None) -> None:
         future = self.executor.submit(save_file, data, path)
         future.add_done_callback(self._task_complete)
