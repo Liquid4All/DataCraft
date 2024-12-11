@@ -244,9 +244,9 @@ class DataManager(SQLBaseManager):
         if "uuid" not in entries:
             # Generate deterministic UUIDs based on data, data_source, and files
             entries["uuid"] = [
-                str(uuid.UUID(bytes=hashlib.sha256(
+                str(uuid.UUID(hex=hashlib.md5( # Use MD5 hash rather than sha256 for speed
                     f"{str(entries['data'][i])}{entries['data_source'][i]}{entries['files'][i]}".encode()
-                ).digest()[:16]))  # Take first 16 bytes for UUID
+                ).hexdigest()))
                 for i in range(num_entries)
             ]
         return self._insert_data(entries)
