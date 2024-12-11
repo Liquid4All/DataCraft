@@ -29,10 +29,12 @@ class Data(BaseData):
         for img, path in zip(images, paths):
             self.add_file(img, path)
         data = {
-            "data": [
-                json.dumps(image_conversation(clean_question(conv[0]["value"]), conv[1]["value"], [img]))
-                for conv, img in zip(examples["conversations"], paths)
-            ],
+            "data": {
+                "conversations": [
+                    json.dumps(image_conversation(clean_question(conv[0]["value"]), conv[1]["value"], [img]))
+                    for conv, img in zip(examples["conversations"], paths)
+                ]
+            },
             "files": [json.dumps([image_path]) for image_path in paths]
         }
         return data
