@@ -34,8 +34,8 @@ class Data(BaseData):
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "value": clean_question(q)}, 
-                            {"type": "image", "value": img_path}
+                            {"type": "image", "value": img_path},
+                            {"type": "text", "value": clean_question(q)}
                         ]
                     },
                     {

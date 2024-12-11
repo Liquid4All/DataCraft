@@ -27,8 +27,8 @@ class Data(BaseData):
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "value": q}, 
-                                {"type": "image", "value": img}
+                                {"type": "image", "value": img},
+                                {"type": "text", "value": q}
                             ]
                         },
                         {

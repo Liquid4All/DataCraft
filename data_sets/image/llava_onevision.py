@@ -1,4 +1,4 @@
-from utils.dataframe import BaseData
+from utils.dataframe import BaseData, HFStaticDataIterator
 import os
 import json
 from datasets import load_dataset
@@ -12,6 +12,9 @@ def clean_question(question):
     return question
 
 class Data(BaseData):
+    info = "LLaVA-OneVision dataset containing image-based conversations"
+    data_type = "conversation"
+
     def __init__(self):
         assert self.dataset_subset is not None, f"""Must provide dataset_subset, choose from {self.dataset_subset}"""
         assert self.dataset_subset in ONEVISION_SUBSETS, f"""got {self.dataset_subset} for dataset_subset, but must be one of {str(ONEVISION_SUBSETS)}"""
@@ -21,20 +24,25 @@ class Data(BaseData):
         self.image_folder_path = os.path.join(self.data_folder_path, "llava-onevision-images") # Saves to images folder
         if not os.path.exists(self.image_folder_path):
             os.makedirs(self.image_folder_path)
-        return load_dataset('lmms-lab/LLaVA-OneVision-Data', self.dataset_subset, split='train', streaming=True)
+        return HFStaticDataIterator(load_dataset('lmms-lab/LLaVA-OneVision-Data', self.dataset_subset, split='train'))
 
     def batch_process(self, examples):
+        # Filter to only include conversations with at least 2 messages
+        valid_indices = [i for i, convs in enumerate(examples["conversations"]) if len(convs) >= 2]
+        examples = {
+            key: [examples[key][i] for i in valid_indices] 
+            for key in examples
+        }
+        
         images = examples["image"]
         paths = [os.path.join(self.image_folder_path, self.dataset_subset + "_" + str(image_id) + ".png") for image_id in examples["id"]]
         for img, path in zip(images, paths):
             self.add_file(img, path)
-        data = {
-            "data": {
-                "conversations": [
-                    json.dumps(image_conversation(clean_question(conv[0]["value"]), conv[1]["value"], [img]))
-                    for conv, img in zip(examples["conversations"], paths)
-                ]
-            },
+        return {
+            "data": [
+                json.dumps({
+                    "conversations": image_conversation(clean_question(conv[0]["value"]), conv[1]["value"], [img])
+                }) for conv, img in zip(examples["conversations"], paths)
+            ],
             "files": [json.dumps([image_path]) for image_path in paths]
         }
-        return data

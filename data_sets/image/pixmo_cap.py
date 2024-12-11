@@ -20,5 +20,5 @@ class Data(BaseData):
         for url, path in zip(urls, paths):
             self.add_file(url, path)
             
-        data = {"data": [json.dumps({"text": cap}) for cap in examples["caption"]], "files": [str([path]) for path in paths]}
+        data = {"data": [json.dumps({"text": cap}) for cap in examples["caption"]], "files": [json.dumps([path]) for path in paths]}
         return data

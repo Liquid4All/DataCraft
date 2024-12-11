@@ -54,9 +54,8 @@ class Data(BaseData):
             })
             for img_path, q, a, labels, texts, points in zip(images, batch["question"], batch["response"], batch["alt_text"], batch["inline_text"], batch["points"])
         ]
-
-        data = {
+        
+        return {
             "data": conversations,
-            "files": images
+            "files": [json.dumps([img_path]) for img_path in images]
         }
-        return data

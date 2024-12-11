@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime
-import json
+import orjson
 import os
 import importlib.util
 import inspect
@@ -9,6 +9,7 @@ import threading
 from typing import List, Dict, Any, Optional, Callable, Union, Tuple
 from tqdm import tqdm
 import hashlib
+from pathlib import Path
 import uuid
 from utils.file_manager import FileManager
 from utils.format import sanitize_filename
@@ -185,7 +186,87 @@ class SQLBaseManager:
             results = [process_row_sync(row_dict) for row_dict in row_dicts]
 
         return results
+    
+    def get_distinct_sources_and_groups(self) -> Tuple[List[str], List[str]]:
+        """
+        Efficiently retrieve distinct data sources and group IDs using index-only scans.
+        Uses recursive CTEs to traverse the B-tree indexes without table scans.
+        
+        Returns:
+            Tuple[List[str], List[str]]: (List of distinct data sources, List of distinct group IDs)
+        """
+        # Query for distinct data sources using index scan
+        sources_query = """
+        WITH RECURSIVE
+          next_source(value) AS (
+            SELECT MIN(data_source) FROM main_table
+            UNION ALL
+            SELECT (
+              SELECT MIN(data_source) 
+              FROM main_table 
+              WHERE data_source > value
+            )
+            FROM next_source
+            WHERE value IS NOT NULL
+          )
+        SELECT value
+        FROM next_source
+        WHERE value IS NOT NULL;
+        """
+        
+        # Query for distinct group IDs using index scan
+        groups_query = """
+        WITH RECURSIVE
+          next_group(value) AS (
+            SELECT MIN(group_id) FROM main_table
+            UNION ALL
+            SELECT (
+              SELECT MIN(group_id) 
+              FROM main_table 
+              WHERE group_id > value
+            )
+            FROM next_group
+            WHERE value IS NOT NULL
+          )
+        SELECT value
+        FROM next_group
+        WHERE value IS NOT NULL;
+        """
+        
+        with self.lock:
+            # Get distinct data sources
+            self.cursor.execute(sources_query)
+            data_sources = [row[0] for row in self.cursor.fetchall()]
+            
+            # Get distinct group IDs
+            self.cursor.execute(groups_query)
+            group_ids = [row[0] for row in self.cursor.fetchall()]
+            
+        return data_sources, group_ids
 
+    def __str__(self) -> str:
+        """
+        Print a summary of the database showing all data sources and group IDs.
+        Uses efficient index scanning to avoid full table scans.
+        """
+        data_sources, group_ids = self.get_distinct_sources_and_groups()
+        
+        lines = [
+            "Database Summary",
+            self.db_path,
+            "-" * 50,
+            "\nData Sources:",
+            "-" * 20,
+            *[f"- {source}" for source in sorted(data_sources)],
+            "\nGroup IDs:",
+            "-" * 20,
+            *[f"- {group}" for group in sorted(group_ids)]
+        ]
+        return '\n'.join(lines)
+
+    def __repr__(self):
+        return str(self)
+    
 ####################################################################################################
 
 class _ErrorFileManager:
@@ -239,7 +320,7 @@ class DataManager(SQLBaseManager):
                 raise ValueError("data_type must be provided if not included in entries.")
             entries["data_type"] = [data_type] * num_entries
         if "files" not in entries:
-            entries["files"] = [json.dumps([])] * num_entries
+            entries["files"] = ["[]"] * num_entries
 
         if "uuid" not in entries:
             # Generate deterministic UUIDs based on data, data_source, and files
@@ -319,7 +400,302 @@ class DataManager(SQLBaseManager):
 
         # Wait for all downloads to complete
         self.file_manager.wait_for_completion()
+
+    def get_data(self, data_sources=None, group_ids=None, limit=0, offset=None):
+        """
+        Fetch data with optional filtering by data sources and/or group IDs, with pagination support.
+        
+        Args:
+            data_sources (list): Optional list of data sources to filter by
+            group_ids (list): Optional list of group IDs to filter by
+            limit (int): Maximum number of records to return (0 for no limit)
+            offset (int): Number of records to skip (None for no offset)
+        
+        Returns:
+            list: List of dictionaries containing query results, with column names as keys
+        """
+        query_parts = ['SELECT * FROM main_table']
+        where_conditions = []
+        params = []
+        
+        # Add data source filter if provided
+        if data_sources:
+            placeholders = ','.join(['?'] * len(data_sources))
+            where_conditions.append(f'data_source IN ({placeholders})')
+            params.extend(data_sources)
+        
+        # Add group ID filter if provided
+        if group_ids:
+            placeholders = ','.join(['?'] * len(group_ids))
+            where_conditions.append(f'group_id IN ({placeholders})')
+            params.extend(group_ids)
+        
+        # Combine WHERE conditions if any exist
+        if where_conditions:
+            query_parts.append('WHERE ' + ' AND '.join(where_conditions))
+        
+        # Add LIMIT clause if specified
+        if limit is not None and limit > 0:
+            query_parts.append('LIMIT ?')
+            params.append(limit)
+        
+        # Add OFFSET clause if specified
+        if offset is not None and offset > 0:
+            query_parts.append('OFFSET ?')
+            params.append(offset)
+        
+        # Combine all parts and execute query
+        query_sql = ' '.join(query_parts)
+        self.cursor.execute(query_sql, params)
+        
+        # Get column names from BASE_TABLE_COLUMNS
+        columns = [col[0] for col in self.BASE_TABLE_COLUMNS]
+        
+        # Convert query results to list of dictionaries
+        results = []
+        for row in self.cursor.fetchall():
+            row_dict = {columns[i]: value for i, value in enumerate(row)}
+            results.append(row_dict)
+        
+        return results
+    
+    def sample_data(self, data_sources=None, group_ids=None, limit=10, offset=None):
+        """
+        Fetch a sample of records for each combination of data source and group ID,
+        or for each data source/group ID individually if only one filter is provided.
+        
+        Args:
+            limit (int): Number of records to fetch per combination
+            data_sources (list): Optional list of data sources to sample from
+            group_ids (list): Optional list of group IDs to sample from
+        
+        Returns:
+            list: List of dictionaries containing sample data, with column names as keys
+        """
+        results = []
+        
+        if data_sources and group_ids:
+            # Get samples for each combination of data source and group ID
+            for data_source in data_sources:
+                for group_id in group_ids:
+                    sample = self.get_data(
+                        data_sources=[data_source],
+                        group_ids=[group_id],
+                        limit=limit,
+                        offset=offset
+                    )
+                    results.extend(sample)
+                    
+        elif data_sources:
+            # Get samples for each data source
+            for data_source in data_sources:
+                sample = self.get_data(
+                    data_sources=[data_source],
+                    limit=limit,
+                    offset=offset
+                )
+                results.extend(sample)
                 
+        elif group_ids:
+            # Get samples for each group ID
+            for group_id in group_ids:
+                sample = self.get_data(
+                    group_ids=[group_id],
+                    limit=limit,
+                    offset=offset
+                )
+                results.extend(sample)
+                
+        else:
+            # If no filters provided, get overall sample
+            results = self.get_data(limit=limit)
+        
+        return results
+
+    def export(
+        self,
+        save_path: str,
+        export_file: str,
+        data_sources: Optional[List[str]] = None,
+        group_ids: Optional[List[str]] = None,
+        limit: int = None,
+        offset: Optional[int] = None,
+        filter_missing_files: bool = True,
+        kwargs: Optional[dict] = {}
+    ) -> None:
+        """
+        Export data by processing each data source separately.
+        
+        Args:
+            save_path (str): Path where exported data should be saved
+            export_file (str): Path to Python file containing EXPORT function
+            data_sources (list, optional): Filter by data sources
+            group_ids (list, optional): Filter by group IDs
+            limit (int, optional): Maximum number of records to export (0 for no limit)
+            offset (int, optional): Number of records to skip
+            kwargs (dict, optional): Additional keyword arguments to pass to the export function
+            
+        Raises:
+            FileNotFoundError: If export_file doesn't exist
+            AttributeError: If EXPORT function not found in export_file
+            ValueError: If invalid limit provided
+        """
+        if not os.path.exists(export_file):
+            raise FileNotFoundError(f"Export file not found: {export_file}")
+            
+        if limit is not None and limit < 1:
+            print("Limit is less than 1, no data will be exported.")
+            return
+        
+        # Import the EXPORT function from the file
+        spec = importlib.util.spec_from_file_location("exporter", export_file)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        
+        if not hasattr(module, "EXPORT"):
+            raise AttributeError(f"EXPORT function not found in {export_file}")
+        
+        export_func = module.EXPORT
+        
+        # If no data sources specified, process all data as one batch
+        if not data_sources:
+            data = self.get_data(
+                group_ids=group_ids,
+                limit=limit,
+                offset=offset
+            )
+            if data:
+                number_written = export_func(data, save_path, **kwargs)
+                if type(number_written) is not int:
+                    number_written = len(data)
+                print(f"Exported {number_written} records.")
+            else:
+                print("No data to export.")
+            return
+
+        # Process each data source separately
+        total_exported = 0
+        for data_source in data_sources:
+            # Get data for current source
+            data = self.get_data(
+                data_sources=[data_source],
+                group_ids=group_ids,
+                limit=limit,
+                offset=offset
+            )
+
+            # Filter the missing files using self.file_manager.file_exists()
+            file_lists = [orjson.loads(row['files']) for row in data]
+            file_present = [all(self.file_manager.file_exists(Path(file)) for file in files) for files in file_lists]
+            data = [data[i] for i, present in enumerate(file_present) if not filter_missing_files or present]
+            
+            if not data:
+                print(f"No data for source: {data_source}")
+                continue
+                
+            # Export the data
+            number_written = export_func(data, save_path, **kwargs)
+            if type(number_written) is not int:
+                number_written = len(data)
+                
+            total_exported += number_written
+            print(f"Exported {number_written} records from source: {data_source}")
+        
+        print(f"Total records exported: {total_exported}")
+                
+    def delete(self, group_ids: Union[str, List[str]] = None, data_sources: Union[str, List[str]] = None, batch_size: int = 1000) -> int:
+        """
+        Delete all data entries associated with specified group IDs and/or data sources, including their index entries.
+        Optimized for constant-time performance relative to database size.
+        
+        Args:
+            group_ids (Union[str, List[str]], optional): Single group ID or list of group IDs to delete
+            data_sources (Union[str, List[str]], optional): Single data source or list of data sources to delete
+                
+        Returns:
+            int: Number of rows deleted
+                
+        Raises:
+            ValueError: If both group_ids and data_sources are None/empty
+        """
+        if not group_ids and not data_sources:
+            raise ValueError("At least one of group_ids or data_sources must be provided")
+        
+        # Convert single values to lists for consistent handling
+        if isinstance(group_ids, str):
+            group_ids = [group_ids]
+        if isinstance(data_sources, str):
+            data_sources = [data_sources]
+        
+        with self.lock:
+            try:
+                self.conn.execute('BEGIN TRANSACTION;')
+                
+                # Cache index table names at initialization
+                if not hasattr(self, '_index_tables'):
+                    self.cursor.execute("""
+                        SELECT name FROM sqlite_master 
+                        WHERE type='table' 
+                        AND (name LIKE 'index_forward_%' OR name LIKE 'index_backward_%')
+                    """)
+                    self._index_tables = [row[0] for row in self.cursor.fetchall()]
+                
+                # Build the WHERE clause dynamically based on provided parameters
+                where_clauses = []
+                params = []
+                
+                if group_ids:
+                    placeholders = ','.join(['?' for _ in group_ids])
+                    where_clauses.append(f'group_id IN ({placeholders})')
+                    params.extend(group_ids)
+                    
+                if data_sources:
+                    placeholders = ','.join(['?' for _ in data_sources])
+                    where_clauses.append(f'data_source IN ({placeholders})')
+                    params.extend(data_sources)
+                    
+                where_clause = ' OR '.join(where_clauses)
+                
+                # Process in batches to handle large deletions
+                total_deleted = 0
+                
+                while True:
+                    # Get next batch of UUIDs to delete using the indexed columns
+                    self.cursor.execute(
+                        f'SELECT uuid FROM main_table WHERE {where_clause} LIMIT {batch_size}',
+                        params
+                    )
+                    batch_uuids = [row[0] for row in self.cursor.fetchall()]
+                    
+                    if not batch_uuids:
+                        break
+                    
+                    # Delete from index tables using batched UUIDs
+                    uuid_placeholders = ','.join(['?' for _ in batch_uuids])
+                    for table in self._index_tables:
+                        col_name = 'row_id'
+                        self.cursor.execute(
+                            f'DELETE FROM {table} WHERE {col_name} IN ({uuid_placeholders})',
+                            batch_uuids
+                        )
+                    
+                    # Delete from main table
+                    self.cursor.execute(
+                        f'DELETE FROM main_table WHERE uuid IN ({uuid_placeholders})',
+                        batch_uuids
+                    )
+                    
+                    total_deleted += len(batch_uuids)
+                
+                self.conn.commit()
+                return total_deleted
+                
+            except Exception as e:
+                self.conn.rollback()
+                raise e
+
+######################################### INDEX SECTION #################################################
+
     def create_index(self, index_name: str, index_function: Callable,
                 data_sources: Optional[List[str]] = None,
                 group_ids: Optional[List[str]] = None,
@@ -433,6 +809,7 @@ class DataManager(SQLBaseManager):
                     self.conn.rollback()
                     raise e
 
+
     def delete_index(self, index_name):
         """
         Delete a index and its associated tables. Warns if tables don't exist.
@@ -460,209 +837,7 @@ class DataManager(SQLBaseManager):
             self.cursor.execute(f'DROP TABLE IF EXISTS index_backward_{index_name};')
             self.conn.commit()
             return True
-
-    def get_data(self, data_sources=None, group_ids=None, limit=0, offset=None):
-        """
-        Fetch data with optional filtering by data sources and/or group IDs, with pagination support.
         
-        Args:
-            data_sources (list): Optional list of data sources to filter by
-            group_ids (list): Optional list of group IDs to filter by
-            limit (int): Maximum number of records to return (0 for no limit)
-            offset (int): Number of records to skip (None for no offset)
-        
-        Returns:
-            list: List of dictionaries containing query results, with column names as keys
-        """
-        query_parts = ['SELECT * FROM main_table']
-        where_conditions = []
-        params = []
-        
-        # Add data source filter if provided
-        if data_sources:
-            placeholders = ','.join(['?'] * len(data_sources))
-            where_conditions.append(f'data_source IN ({placeholders})')
-            params.extend(data_sources)
-        
-        # Add group ID filter if provided
-        if group_ids:
-            placeholders = ','.join(['?'] * len(group_ids))
-            where_conditions.append(f'group_id IN ({placeholders})')
-            params.extend(group_ids)
-        
-        # Combine WHERE conditions if any exist
-        if where_conditions:
-            query_parts.append('WHERE ' + ' AND '.join(where_conditions))
-        
-        # Add LIMIT clause if specified
-        if limit > 0:
-            query_parts.append('LIMIT ?')
-            params.append(limit)
-        
-        # Add OFFSET clause if specified
-        if offset is not None:
-            query_parts.append('OFFSET ?')
-            params.append(offset)
-        
-        # Combine all parts and execute query
-        query_sql = ' '.join(query_parts)
-        self.cursor.execute(query_sql, params)
-        
-        # Get column names from BASE_TABLE_COLUMNS
-        columns = [col[0] for col in self.BASE_TABLE_COLUMNS]
-        
-        # Convert query results to list of dictionaries
-        results = []
-        for row in self.cursor.fetchall():
-            row_dict = {columns[i]: value for i, value in enumerate(row)}
-            results.append(row_dict)
-        
-        return results
-    
-    def sample_data(self, data_sources=None, group_ids=None, limit=10, offset=None):
-        """
-        Fetch a sample of records for each combination of data source and group ID,
-        or for each data source/group ID individually if only one filter is provided.
-        
-        Args:
-            limit (int): Number of records to fetch per combination
-            data_sources (list): Optional list of data sources to sample from
-            group_ids (list): Optional list of group IDs to sample from
-        
-        Returns:
-            list: List of dictionaries containing sample data, with column names as keys
-        """
-        results = []
-        
-        if data_sources and group_ids:
-            # Get samples for each combination of data source and group ID
-            for data_source in data_sources:
-                for group_id in group_ids:
-                    sample = self.get_data(
-                        data_sources=[data_source],
-                        group_ids=[group_id],
-                        limit=limit,
-                        offset=offset
-                    )
-                    results.extend(sample)
-                    
-        elif data_sources:
-            # Get samples for each data source
-            for data_source in data_sources:
-                sample = self.get_data(
-                    data_sources=[data_source],
-                    limit=limit,
-                    offset=offset
-                )
-                results.extend(sample)
-                
-        elif group_ids:
-            # Get samples for each group ID
-            for group_id in group_ids:
-                sample = self.get_data(
-                    group_ids=[group_id],
-                    limit=limit,
-                    offset=offset
-                )
-                results.extend(sample)
-                
-        else:
-            # If no filters provided, get overall sample
-            results = self.get_data(limit=limit)
-        
-        return results
-
-    def delete(self, group_ids: Union[str, List[str]] = None, data_sources: Union[str, List[str]] = None, batch_size: int = 1000) -> int:
-        """
-        Delete all data entries associated with specified group IDs and/or data sources, including their index entries.
-        Optimized for constant-time performance relative to database size.
-        
-        Args:
-            group_ids (Union[str, List[str]], optional): Single group ID or list of group IDs to delete
-            data_sources (Union[str, List[str]], optional): Single data source or list of data sources to delete
-                
-        Returns:
-            int: Number of rows deleted
-                
-        Raises:
-            ValueError: If both group_ids and data_sources are None/empty
-        """
-        if not group_ids and not data_sources:
-            raise ValueError("At least one of group_ids or data_sources must be provided")
-        
-        # Convert single values to lists for consistent handling
-        if isinstance(group_ids, str):
-            group_ids = [group_ids]
-        if isinstance(data_sources, str):
-            data_sources = [data_sources]
-        
-        with self.lock:
-            try:
-                self.conn.execute('BEGIN TRANSACTION;')
-                
-                # Cache index table names at initialization
-                if not hasattr(self, '_index_tables'):
-                    self.cursor.execute("""
-                        SELECT name FROM sqlite_master 
-                        WHERE type='table' 
-                        AND (name LIKE 'index_forward_%' OR name LIKE 'index_backward_%')
-                    """)
-                    self._index_tables = [row[0] for row in self.cursor.fetchall()]
-                
-                # Build the WHERE clause dynamically based on provided parameters
-                where_clauses = []
-                params = []
-                
-                if group_ids:
-                    placeholders = ','.join(['?' for _ in group_ids])
-                    where_clauses.append(f'group_id IN ({placeholders})')
-                    params.extend(group_ids)
-                    
-                if data_sources:
-                    placeholders = ','.join(['?' for _ in data_sources])
-                    where_clauses.append(f'data_source IN ({placeholders})')
-                    params.extend(data_sources)
-                    
-                where_clause = ' OR '.join(where_clauses)
-                
-                # Process in batches to handle large deletions
-                total_deleted = 0
-                
-                while True:
-                    # Get next batch of UUIDs to delete using the indexed columns
-                    self.cursor.execute(
-                        f'SELECT uuid FROM main_table WHERE {where_clause} LIMIT {batch_size}',
-                        params
-                    )
-                    batch_uuids = [row[0] for row in self.cursor.fetchall()]
-                    
-                    if not batch_uuids:
-                        break
-                    
-                    # Delete from index tables using batched UUIDs
-                    uuid_placeholders = ','.join(['?' for _ in batch_uuids])
-                    for table in self._index_tables:
-                        col_name = 'row_id'
-                        self.cursor.execute(
-                            f'DELETE FROM {table} WHERE {col_name} IN ({uuid_placeholders})',
-                            batch_uuids
-                        )
-                    
-                    # Delete from main table
-                    self.cursor.execute(
-                        f'DELETE FROM main_table WHERE uuid IN ({uuid_placeholders})',
-                        batch_uuids
-                    )
-                    
-                    total_deleted += len(batch_uuids)
-                
-                self.conn.commit()
-                return total_deleted
-                
-            except Exception as e:
-                self.conn.rollback()
-                raise e
-
     def get_index_values_for_row(self, index_name, row_id):
         """
         Get all index values associated with a specific row.
@@ -680,3 +855,9 @@ class DataManager(SQLBaseManager):
         )
         values = self.cursor.fetchall()
         return [value[0] for value in values]
+
+######################################### FILTER SECTION #################################################
+
+
+
+######################################## FUNCTION SECTION ################################################

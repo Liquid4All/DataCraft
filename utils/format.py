@@ -65,9 +65,9 @@ def image_conversation(question, answer, images):
     return [
         {
             "role": "user", 
-            "content": [
+            "content": image_content + [
                 {"type": "text", "value": question},
-            ] + image_content
+            ]
         },
         {
             "role": "assistant", 

@@ -3,6 +3,7 @@ asyncio
 
 # Data
 datasets
+jsonlines
 huggingface_hub
 pillow
 opencv-python
