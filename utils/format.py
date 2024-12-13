@@ -1,5 +1,6 @@
 import hashlib
 import re
+from typing import List, Dict, Any
 
 def name_url(url):
     """
@@ -76,3 +77,47 @@ def image_conversation(question, answer, images):
             ]
         }
     ]
+
+def chatml_to_conversation(chatml_data: List[Dict[str, str]]) -> Dict[str, List[Dict[str, List[Dict[str, str]]]]]:
+    """
+    Convert ChatML format to multi-modal format.
+    
+    Args:
+        chatml_data: A list of dictionaries in ChatML format
+        
+    Returns:
+        Dictionary in multi-modal format
+    """
+    # Validate input
+    if not isinstance(chatml_data, list):
+        raise ValueError("Input must be a list of messages")
+        
+    conversations = []
+    
+    # Convert each message
+    for message in chatml_data:
+        if not isinstance(message, dict) or 'role' not in message or 'content' not in message:
+            raise ValueError("Each message must have 'role' and 'content' fields")
+            
+        # Validate role
+        if message['role'] not in ['system', 'user', 'assistant']:
+            raise ValueError("Role must be one of: system, user, assistant")
+            
+        # Convert to multi-modal format
+        converted_message = {
+            "role": message['role'],
+            "content": [
+                {
+                    "type": "text",
+                    "value": message['content']
+                }
+            ]
+        }
+        conversations.append(converted_message)
+    
+    # Create final structure
+    result = {
+        "conversations": conversations
+    }
+    
+    return result

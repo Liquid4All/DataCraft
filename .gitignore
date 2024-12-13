@@ -13,3 +13,5 @@ env/
 logs/
 *.db
 *.sqlite3
+temp*.py
+temp*.ipynb

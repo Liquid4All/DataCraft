@@ -1,5 +1,6 @@
 from typing import Dict, List
 import os
+import re
 import json
 from datasets import load_dataset
 from utils.format import name_url
@@ -17,6 +18,23 @@ def format_points(labels, texts, points):
         }
         for [x, y], label, txt in zip(points[0], labels, texts)
     ]
+
+def get_next_replacement(match: re.Match, replacements: list, index: int) -> str:
+    if index >= len(replacements):
+        return match.group(0)  # Return original if no more replacements
+    return replacements[index]
+
+def replace_points(text: str, replacements: list) -> str:
+    pattern = r'<point[^>]*>.*?</point>'
+    index = 0
+    
+    def replace_callback(match: re.Match) -> str:
+        nonlocal index
+        result = get_next_replacement(match, replacements, index)
+        index += 1
+        return result
+    
+    return re.sub(pattern, replace_callback, text)
 
 class Data(BaseData):
     info = "PIXMO Point Explanations dataset containing image-based conversations"
@@ -46,7 +64,7 @@ class Data(BaseData):
                     {
                         "role": "assistant",
                         "content": [
-                            {"type": "text", "value": a}
+                            {"type": "text", "value": replace_points(a, texts)}
                         ]
                     }
                 ],

@@ -48,10 +48,26 @@ def download_file(url, path, headers=None, max_retries=1, timeout=0.5, buffer_si
     
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
+    # Get file extension from path
+    file_extension = os.path.splitext(path)[1].lower()
+    
     for attempt in range(max_retries):
         try:
             response = requests.get(url, headers=headers, stream=True, timeout=timeout)
             response.raise_for_status()
+            
+            content_type = response.headers.get('content-type', '').lower()
+            
+            # Check for content type mismatch
+            if ('text/html' in content_type and 
+                file_extension not in ['.txt', '.html', '.htm']):
+                return {
+                    'status': response.status_code,
+                    'file': None,
+                    'error': f'Content type mismatch: received {content_type} for file with extension {file_extension}',
+                    'success': False,
+                    'operation_type': 'download'
+                }
             
             response.raw.decode_content = True
             bytes_written = 0
@@ -61,8 +77,8 @@ def download_file(url, path, headers=None, max_retries=1, timeout=0.5, buffer_si
             return {
                 'status': response.status_code,
                 'file': path,
-                'size': bytes_written,  # Track size during write instead of extra fs call
-                'content_type': response.headers.get('content-type'),
+                'size': bytes_written,
+                'content_type': content_type,
                 'success': True,
                 'operation_type': 'download'
             }
@@ -195,42 +211,34 @@ class FileManager:
                 operation_type = 'download'
                 result = download_file(data, str(path))
                 
-            elif content_type == 'application/octet-stream':
-                operation_type = 'write_bytes'
-                with open(path, 'wb') as f:
-                    f.write(data)
+            # elif content_type == 'application/octet-stream':
+            #     operation_type = 'write_bytes'
+            #     with open(path, 'wb') as f:
+            #         f.write(data)
                 
-            elif content_type == 'image/pil':
-                operation_type = 'save_image'
-                save_kwargs = {}
-                if force_format:
-                    save_kwargs['format'] = force_format
-                if 'quality' in kwargs and path.suffix.lower() in ['.jpg', '.jpeg']:
-                    save_kwargs['quality'] = kwargs['quality']
-                data.save(path, **save_kwargs)
+            else:# content_type == 'image/pil':
+                data.save(path)
                 
-            elif content_type == 'image/numpy':
-                operation_type = 'save_numpy_image'
-                Image.fromarray(
-                    data if data.dtype == np.uint8 else (data * 255).astype(np.uint8)
-                ).save(path, format=force_format)
+            # elif content_type == 'image/numpy':
+            #     operation_type = 'save_numpy_image'
+            #     Image.fromarray(
+            #         data if data.dtype == np.uint8 else (data * 255).astype(np.uint8)
+            #     ).save(path, format=force_format)
                 
-            elif content_type == 'audio/numpy':
-                operation_type = 'save_audio'
-                sf.write(
-                    path, 
-                    data, 
-                    samplerate=kwargs.get('samplerate', 44100)
-                )
+            # elif content_type == 'audio/numpy':
+            #     operation_type = 'save_audio'
+            #     sf.write(
+            #         path, 
+            #         data, 
+            #         samplerate=kwargs.get('samplerate', 44100)
+            #     )
                 
-            elif content_type == 'tensor/pytorch':
-                operation_type = 'save_tensor'
-                torch.save(data, path)
+            # elif content_type == 'tensor/pytorch':
+            #     operation_type = 'save_tensor'
+            #     torch.save(data, path)
                 
-            else:
-                operation_type = 'save_pickle'
-                with open(path, 'wb') as f:
-                    pickle.dump(data, f, protocol=4)
+            # else:
+            #     raise ValueError(f"Unsupported data type: {content_type}")
 
             with self.lock:
                 self.currently_processing.remove(path)
